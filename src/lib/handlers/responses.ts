@@ -59,6 +59,7 @@ import {
   resolveToolChoice,
   responsesToolOutputs,
   type PendingClientToolCall,
+  type ClientToolDefinition,
 } from "../tool-types.js";
 import {
   ToolSessionError,
@@ -67,6 +68,17 @@ import {
   type ToolSessionRegistry,
 } from "../tool-session-registry.js";
 import { getCachedCursorModels, type ModelCacheRef } from "./models.js";
+import {
+  appendResponsesToolOutputs,
+  appendResponsesToolResult,
+  assertResponsesToolControls,
+  createResponsesToolReplayState,
+  prepareResponsesToolResume,
+  responsesReferencedCallIds,
+  responsesTrailingOutputCallIds,
+  type ResponsesToolControlKey,
+  type ResponsesToolControlValues,
+} from "../responses-tool-replay.js";
 
 function isRateLimited(stderr: string): boolean {
   return /\b429\b|rate.?limit|too many requests/i.test(stderr);
@@ -87,9 +99,63 @@ function functionCallItem(call: PendingClientToolCall) {
     type: "function_call",
     status: "completed",
     call_id: call.callId,
+    ...(call.namespace ? { namespace: call.namespace } : {}),
     name: call.name,
     arguments: call.arguments,
   };
+}
+
+function responsesToolControlValues(opts: {
+  model: string;
+  mode: CursorExecutionMode;
+  body: OpenAiResponsesRequest;
+  tools: ClientToolDefinition[];
+}): ResponsesToolControlValues {
+  return {
+    model: opts.model,
+    mode: opts.mode,
+    instructions:
+      typeof opts.body.instructions === "string"
+        ? opts.body.instructions.trim()
+        : null,
+    tools: [...opts.tools].sort((left, right) =>
+      `${left.namespace ?? ""}\u0000${left.name}`.localeCompare(
+        `${right.namespace ?? ""}\u0000${right.name}`,
+      ),
+    ),
+    tool_choice: opts.body.tool_choice ?? "auto",
+    parallel_tool_calls: opts.body.parallel_tool_calls ?? true,
+    reasoning: opts.body.reasoning ?? null,
+  };
+}
+
+function suppliedResponseToolControls(
+  body: OpenAiResponsesRequest,
+  values: ResponsesToolControlValues,
+  includeInstructions: boolean,
+  headerMode: string | string[] | undefined,
+): Partial<Record<ResponsesToolControlKey, unknown>> {
+  const supplied: Partial<Record<ResponsesToolControlKey, unknown>> = {};
+  if (Object.hasOwn(body, "model")) supplied.model = values.model;
+  if (
+    Object.hasOwn(body, "mode") ||
+    (typeof headerMode === "string" && headerMode.trim()) ||
+    (Array.isArray(headerMode) && headerMode.some((value) => value.trim()))
+  ) {
+    supplied.mode = values.mode;
+  }
+  if (includeInstructions || Object.hasOwn(body, "instructions")) {
+    supplied.instructions = values.instructions;
+  }
+  if (Object.hasOwn(body, "tools")) supplied.tools = values.tools;
+  if (Object.hasOwn(body, "tool_choice")) {
+    supplied.tool_choice = values.tool_choice;
+  }
+  if (Object.hasOwn(body, "parallel_tool_calls")) {
+    supplied.parallel_tool_calls = values.parallel_tool_calls;
+  }
+  if (Object.hasOwn(body, "reasoning")) supplied.reasoning = values.reasoning;
+  return supplied;
 }
 
 function structuredResponseObject(opts: {
@@ -169,6 +235,7 @@ async function writeStructuredResponseTurn(opts: {
   model: string | undefined;
   previousResponseId?: string | null;
   promptLength: number;
+  onResult?: (result: ToolTurnResult) => void;
   run: (
     listener?: (event: ToolTurnEvent) => void,
   ) => Promise<ToolTurnResult>;
@@ -176,6 +243,7 @@ async function writeStructuredResponseTurn(opts: {
   const messageId = `msg_${randomUUID().replace(/-/g, "")}`;
   if (!opts.stream) {
     const result = await opts.run();
+    opts.onResult?.(result);
     json(
       opts.res,
       200,
@@ -241,6 +309,7 @@ async function writeStructuredResponseTurn(opts: {
     const result = await opts.run((event) => {
       if (event.type === "text") emitText(event.text);
     });
+    opts.onResult?.(result);
     if (result.text.length > emittedText.length) {
       emitText(result.text.slice(emittedText.length));
     }
@@ -284,6 +353,7 @@ async function writeStructuredResponseTurn(opts: {
             type: "function_call",
             status: "in_progress",
             call_id: call.callId,
+            ...(call.namespace ? { namespace: call.namespace } : {}),
             name: call.name,
             arguments: "",
           },
@@ -458,12 +528,15 @@ export async function handleResponses(
   const { config, lastRequestedModelRef, modelCacheRef } = ctx;
   const body = JSON.parse(rawBody || "{}") as OpenAiResponsesRequest;
   let selectedTools;
+  let parsedTools = [] as ReturnType<typeof parseOpenAiFunctionTools>;
   let toolInstruction: string | undefined;
   let requireToolCall = false;
   let maxParallelToolCalls: number | undefined;
   let submittedToolOutputs;
   try {
-    const parsedTools = parseOpenAiFunctionTools(body.tools);
+    parsedTools = parseOpenAiFunctionTools(body.tools, undefined, {
+      allowNamespaces: true,
+    });
     const choice = resolveToolChoice(parsedTools, body.tool_choice, {
       parallelToolCalls: body.parallel_tool_calls,
     });
@@ -481,38 +554,6 @@ export async function handleResponses(
       },
     });
     return;
-  }
-  if (config.useAcp && submittedToolOutputs.length > 0) {
-    if (
-      Array.isArray(body.input) &&
-      body.input.some(
-        (item) =>
-          !item ||
-          typeof item !== "object" ||
-          (item as { type?: unknown }).type !== "function_call_output",
-      )
-    ) {
-      json(res, 400, {
-        error: {
-          message:
-            "A function_call_output resume cannot include other input item types",
-          code: "invalid_tool_resume",
-          type: "invalid_request_error",
-        },
-      });
-      return;
-    }
-    if (body.instructions != null) {
-      json(res, 400, {
-        error: {
-          message:
-            "instructions cannot change while an ACP tool turn is active",
-          code: "invalid_tool_resume",
-          type: "invalid_request_error",
-        },
-      });
-      return;
-    }
   }
   const ownerKey = toolSessionOwnerKey(req, remoteAddress);
   const requested = normalizeModelId(body.model);
@@ -553,22 +594,93 @@ export async function handleResponses(
   const id = `resp_${randomUUID().replace(/-/g, "")}`;
   const createdAt = Math.floor(Date.now() / 1000);
 
-  const cleanMessages = sanitizeMessages(responsesInputToMessages(body));
-  const structuredToolStart =
-    config.useAcp &&
-    selectedTools.length > 0 &&
-    submittedToolOutputs.length === 0;
-  if (structuredToolStart && body.store === false) {
-    json(res, 400, {
-      error: {
-        message:
-          "store=false is incompatible with stateful ACP tool passthrough",
-        code: "invalid_store",
-        type: "invalid_request_error",
-      },
-    });
+  let mode: CursorExecutionMode;
+  try {
+    mode = resolveRequestMode(
+      config,
+      req.headers["x-cursor-mode"],
+      body.mode,
+      responsesInputToMessages(body),
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Invalid mode";
+    json(res, 400, { error: { message: msg, code: "invalid_mode" } });
     return;
   }
+
+  const controlValues = responsesToolControlValues({
+    model: cursorModel,
+    mode,
+    body,
+    tools: parsedTools,
+  });
+  const previousResponseId = body.previous_response_id;
+  const trailingOutputCallIds = responsesTrailingOutputCallIds(body.input);
+  let resumeRecord: ToolSessionRecord | undefined;
+  if (config.useAcp) {
+    if (submittedToolOutputs.length > 0 && typeof previousResponseId === "string") {
+      resumeRecord = ctx.toolSessions.findByResponseId(
+        ownerKey,
+        previousResponseId,
+      );
+      if (!resumeRecord) {
+        json(res, 409, {
+          error: {
+            message:
+              "Response tool session is missing or expired; resend the original input",
+            code: "tool_session_expired",
+            type: "invalid_request_error",
+          },
+        });
+        return;
+      }
+    } else if (
+      submittedToolOutputs.length > 0 &&
+      trailingOutputCallIds.length > 0
+    ) {
+      resumeRecord = ctx.toolSessions.findByAnyCallIds(
+        "responses",
+        ownerKey,
+        trailingOutputCallIds,
+      ) ?? ctx.toolSessions.findByReferencedCallIds(
+        "responses",
+        ownerKey,
+        responsesReferencedCallIds(body.input),
+      );
+      if (!resumeRecord) {
+        json(res, 409, {
+          error: {
+            message:
+              "Response tool session is missing or expired; resend the original input",
+            code: "tool_session_expired",
+            type: "invalid_request_error",
+          },
+        });
+        return;
+      }
+    } else {
+      const referenced = responsesReferencedCallIds(body.input);
+      const activeRecord = ctx.toolSessions.findByReferencedCallIds(
+        "responses",
+        ownerKey,
+        referenced,
+      );
+      if (activeRecord) {
+        json(res, 400, {
+          error: {
+            message:
+              "An active ACP tool replay cannot add user or other input before pending function_call_output items",
+            code: "invalid_tool_resume",
+            type: "invalid_request_error",
+          },
+        });
+        return;
+      }
+    }
+  }
+  const structuredToolStart =
+    config.useAcp && selectedTools.length > 0 && !resumeRecord;
+  const cleanMessages = sanitizeMessages(responsesInputToMessages(body));
   const toolsText = structuredToolStart
     ? undefined
     : body.tool_choice === "none"
@@ -594,24 +706,88 @@ export async function handleResponses(
     !!body.stream,
   );
 
-  if (config.useAcp && submittedToolOutputs.length > 0) {
-    const previousResponseId = body.previous_response_id;
-    const record =
-      typeof previousResponseId === "string"
-        ? ctx.toolSessions.findByResponseId(ownerKey, previousResponseId)
-        : undefined;
+  if (config.useAcp && resumeRecord) {
+    const record = resumeRecord;
     if (
-      !record ||
       record.api !== "responses" ||
-      !submittedToolOutputs.every((output) =>
-        record.session.hasCall(output.callId),
-      )
+      !record.responsesReplay
     ) {
       json(res, 409, {
         error: {
           message:
             "Response tool session is missing or expired; resend the original input",
           code: "tool_session_expired",
+          type: "invalid_request_error",
+        },
+      });
+      return;
+    }
+    let resumePlan;
+    try {
+      resumePlan = prepareResponsesToolResume({
+        input: body.input,
+        state: record.responsesReplay,
+      });
+      assertResponsesToolControls(
+        record.responsesReplay,
+        suppliedResponseToolControls(
+          body,
+          controlValues,
+          resumePlan.kind === "replay",
+          req.headers["x-cursor-mode"],
+        ),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      json(res, 400, {
+        error: {
+          message,
+          code: message.startsWith("Responses tools changed")
+            ? "invalid_tool_definition"
+            : "invalid_tool_resume",
+          type: "invalid_request_error",
+        },
+      });
+      return;
+    }
+    const outputs = resumePlan.outputs;
+    if (!outputs.every((output) => record.session.hasCall(output.callId))) {
+      json(res, 409, {
+        error: {
+          message:
+            "Response tool session is missing or expired; resend the original input",
+          code: "tool_session_expired",
+          type: "invalid_request_error",
+        },
+      });
+      return;
+    }
+    if (
+      !outputs.every((output) =>
+        record.session.matchesOutput(output),
+      )
+    ) {
+      json(res, 400, {
+        error: {
+          message:
+            "function_call_output namespace/name does not match the pending tool call",
+          code: "invalid_tool_identity",
+          type: "invalid_request_error",
+        },
+      });
+      return;
+    }
+    if (
+      Object.hasOwn(body, "tools") &&
+      !outputs.every((output) =>
+        record.session.matchesDefinition(output.callId, parsedTools),
+      )
+    ) {
+      json(res, 400, {
+        error: {
+          message:
+            "Responses tool definitions do not match the pending tool call identity",
+          code: "invalid_tool_definition",
           type: "invalid_request_error",
         },
       });
@@ -641,14 +817,21 @@ export async function handleResponses(
         run: async (listener) => {
           const turn = await ctx.toolSessions.resume(
             record,
-            submittedToolOutputs,
+            outputs,
             listener,
+            () =>
+              appendResponsesToolOutputs(
+                record.responsesReplay!,
+                outputs,
+              ),
           );
           if (turn.status === "tool_calls") {
             ctx.toolSessions.aliasResponse(record, id);
           }
           return turn;
         },
+        onResult: (turn) =>
+          appendResponsesToolResult(record.responsesReplay!, turn),
       });
       reportRequestSuccess(configDir, Date.now() - startedAt);
       logTrafficResponse(
@@ -690,20 +873,6 @@ export async function handleResponses(
     return;
   }
 
-  let mode: CursorExecutionMode;
-  try {
-    mode = resolveRequestMode(
-      config,
-      req.headers["x-cursor-mode"],
-      body.mode,
-      responsesInputToMessages(body),
-    );
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "Invalid mode";
-    json(res, 400, { error: { message: msg, code: "invalid_mode" } });
-    return;
-  }
-
   const effectiveChatOnly =
     mode === "ask"
       ? config.chatOnlyWorkspace
@@ -741,11 +910,20 @@ export async function handleResponses(
     mode,
     effectiveChatOnly,
   );
-  const fit = fitPromptToWinCmdline(config.agentBin, fixedArgs, agentPrompt, {
-    maxCmdline: config.winCmdlineMax,
-    platform: process.platform,
-    cwd: workspaceDir,
-  });
+  const promptViaStdin = config.promptViaStdin || config.useAcp;
+  const fit = promptViaStdin
+    ? {
+        ok: true as const,
+        args: fixedArgs,
+        truncated: false,
+        originalLength: agentPrompt.length,
+        finalPromptLength: agentPrompt.length,
+      }
+    : fitPromptToWinCmdline(config.agentBin, fixedArgs, agentPrompt, {
+        maxCmdline: config.winCmdlineMax,
+        platform: process.platform,
+        cwd: workspaceDir,
+      });
   if (!fit.ok) {
     json(res, 500, {
       error: {
@@ -762,12 +940,11 @@ export async function handleResponses(
   // When the prompt is delivered via stdin (or ACP), keep it OUT of argv,
   // otherwise a long prompt still blows past the kernel ARG_MAX (spawn E2BIG
   // on Linux). fit.args appends the full prompt for the argv path only.
-  const cmdArgs =
-    config.promptViaStdin || config.useAcp ? fixedArgs : fit.args;
+  const cmdArgs = promptViaStdin ? fixedArgs : fit.args;
 
   const itemId = `msg_${randomUUID().replace(/-/g, "")}`;
   const promptForAgent =
-    config.promptViaStdin || config.useAcp ? agentPrompt : undefined;
+    promptViaStdin ? agentPrompt : undefined;
   const truncatedHeaders = fit.truncated
     ? { "X-Cursor-Proxy-Prompt-Truncated": "true" }
     : undefined;
@@ -802,6 +979,10 @@ export async function handleResponses(
         configDir,
         session,
       });
+      record.responsesReplay = createResponsesToolReplayState({
+        input: body.input,
+        controls: controlValues,
+      });
       abortController.signal.addEventListener(
         "abort",
         () => void session.close(),
@@ -823,6 +1004,8 @@ export async function handleResponses(
           }
           return turn;
         },
+        onResult: (turn) =>
+          appendResponsesToolResult(record!.responsesReplay!, turn),
       });
       reportRequestSuccess(configDir, Date.now() - startedAt);
       if (

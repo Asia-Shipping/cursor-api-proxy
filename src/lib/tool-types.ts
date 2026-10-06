@@ -1,11 +1,15 @@
 export type ClientToolDefinition = {
   name: string;
+  namespace?: string;
+  namespaceDescription?: string;
   description?: string;
   inputSchema: Record<string, unknown>;
 };
 
 export type ClientToolOutput = {
   callId: string;
+  name?: string;
+  namespace?: string;
   output: string;
   isError?: boolean;
 };
@@ -14,6 +18,7 @@ export type PendingClientToolCall = {
   callId: string;
   itemId: string;
   name: string;
+  namespace?: string;
   arguments: string;
 };
 
@@ -48,20 +53,41 @@ function pushUnique(
   if (!definition.name.trim()) {
     throw new Error("Function tool is missing name");
   }
-  if (seen.has(definition.name)) {
-    throw new Error(`Duplicate function tool name: ${definition.name}`);
+  const identity = JSON.stringify([definition.namespace ?? null, definition.name]);
+  if (seen.has(identity)) {
+    const qualifiedName = definition.namespace
+      ? `${definition.namespace}.${definition.name}`
+      : definition.name;
+    throw new Error(`Duplicate function tool name: ${qualifiedName}`);
   }
-  seen.add(definition.name);
+  seen.add(identity);
   out.push(definition);
+}
+
+function functionDefinition(tool: Record<string, unknown>): ClientToolDefinition {
+  const wrapped = asRecord(tool.function);
+  const fn = wrapped ?? tool;
+  if (typeof fn.name !== "string") {
+    throw new Error("Function tool is missing name");
+  }
+  return {
+    name: fn.name,
+    description:
+      typeof fn.description === "string" ? fn.description : undefined,
+    inputSchema: schemaOrDefault(fn.parameters),
+  };
 }
 
 /**
  * Parse OpenAI Chat Completions (`function` wrapper), Responses (flat
- * function), and legacy Chat `functions` definitions.
+ * function), namespaced Responses functions, and legacy Chat `functions`
+ * definitions. Unsupported tools are rejected because the ACP bridge cannot
+ * execute them on behalf of the caller.
  */
 export function parseOpenAiFunctionTools(
   tools?: readonly unknown[],
   functions?: readonly unknown[],
+  options: { allowNamespaces?: boolean } = {},
 ): ClientToolDefinition[] {
   const out: ClientToolDefinition[] = [];
   const seen = new Set<string>();
@@ -69,6 +95,38 @@ export function parseOpenAiFunctionTools(
   for (const value of tools ?? []) {
     const tool = asRecord(value);
     if (!tool) throw new Error("Invalid tool definition");
+    if (tool.type === "namespace") {
+      if (!options.allowNamespaces) {
+        throw new Error("Namespace tools are only supported by the Responses API");
+      }
+      if (typeof tool.name !== "string" || !tool.name.trim()) {
+        throw new Error("Namespace tool is missing name");
+      }
+      if (!Array.isArray(tool.tools)) {
+        throw new Error(`Namespace ${tool.name} is missing tools array`);
+      }
+      for (const member of tool.tools) {
+        const nested = asRecord(member);
+        if (!nested) {
+          throw new Error(`Invalid function tool in namespace ${tool.name}`);
+        }
+        if (nested.type !== "function") {
+          throw new Error(
+            `Unsupported tool type in namespace ${tool.name}: ${
+              typeof nested.type === "string" ? nested.type : "unknown"
+            }`,
+          );
+        }
+        pushUnique(out, seen, {
+          ...functionDefinition(nested),
+          namespace: tool.name,
+          ...(typeof tool.description === "string"
+            ? { namespaceDescription: tool.description }
+            : {}),
+        });
+      }
+      continue;
+    }
     if (tool.type !== "function") {
       throw new Error(
         `Unsupported tool type: ${
@@ -76,17 +134,7 @@ export function parseOpenAiFunctionTools(
         }`,
       );
     }
-    const wrapped = asRecord(tool.function);
-    const fn = wrapped ?? tool;
-    if (typeof fn.name !== "string") {
-      throw new Error("Function tool is missing name");
-    }
-    pushUnique(out, seen, {
-      name: fn.name,
-      description:
-        typeof fn.description === "string" ? fn.description : undefined,
-      inputSchema: schemaOrDefault(fn.parameters),
-    });
+    pushUnique(out, seen, functionDefinition(tool));
   }
 
   for (const value of functions ?? []) {
@@ -125,12 +173,25 @@ export function parseAnthropicFunctionTools(
   return out;
 }
 
-function namedChoice(choice: unknown): string | undefined {
+type ToolChoiceSelector = { name: string; namespace?: string };
+
+function namedChoice(choice: unknown): ToolChoiceSelector | undefined {
   const rec = asRecord(choice);
   if (!rec) return undefined;
-  if (typeof rec.name === "string") return rec.name;
   const fn = asRecord(rec.function);
-  if (fn && typeof fn.name === "string") return fn.name;
+  const name =
+    typeof rec.name === "string"
+      ? rec.name
+      : typeof fn?.name === "string"
+        ? fn.name
+        : undefined;
+  const namespace =
+    typeof rec.namespace === "string"
+      ? rec.namespace
+      : typeof fn?.namespace === "string"
+        ? fn.namespace
+        : undefined;
+  if (name !== undefined) return { name, namespace };
   return undefined;
 }
 
@@ -148,14 +209,58 @@ export function resolveToolChoice(
     choice === "any" ||
     asRecord(choice)?.type === "any";
   const selected = namedChoice(choice);
+  const choiceRecord = asRecord(choice);
+  if (choiceRecord?.type === "namespace") {
+    throw new Error("Namespace tool_choice must identify a function");
+  }
+  if (choiceRecord?.namespace != null && typeof choiceRecord.namespace !== "string") {
+    throw new Error("tool_choice namespace must be a string");
+  }
+  if (choiceRecord?.function != null) {
+    const functionChoice = asRecord(choiceRecord.function);
+    if (!functionChoice) {
+      throw new Error("tool_choice function must be an object");
+    }
+    if (
+      functionChoice.namespace != null &&
+      typeof functionChoice.namespace !== "string"
+    ) {
+      throw new Error("tool_choice namespace must be a string");
+    }
+  }
   let resolved = [...tools];
   let instruction: string | undefined;
 
   if (selected) {
-    const tool = tools.find((item) => item.name === selected);
-    if (!tool) throw new Error(`Unknown tool_choice function: ${selected}`);
+    if (!selected.name.trim()) {
+      throw new Error("tool_choice function is missing name");
+    }
+    if (selected.namespace !== undefined && !selected.namespace.trim()) {
+      throw new Error("tool_choice namespace must not be empty");
+    }
+    const matches = tools.filter(
+      (item) =>
+        item.name === selected.name &&
+        (selected.namespace === undefined ||
+          item.namespace === selected.namespace),
+    );
+    if (matches.length === 0) {
+      const qualifiedName = selected.namespace
+        ? `${selected.namespace}.${selected.name}`
+        : selected.name;
+      throw new Error(`Unknown tool_choice function: ${qualifiedName}`);
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `Ambiguous tool_choice function: ${selected.name}; specify namespace`,
+      );
+    }
+    const [tool] = matches;
     resolved = [tool];
-    instruction = `You must call the ${selected} tool.`;
+    const qualifiedName = tool.namespace
+      ? `${tool.namespace}.${tool.name}`
+      : tool.name;
+    instruction = `You must call the ${qualifiedName} tool.`;
   } else if (required) {
     instruction = "You must call at least one available tool.";
   }
@@ -181,7 +286,10 @@ function stringifyOutput(value: unknown): string {
       .map((part) => {
         if (typeof part === "string") return part;
         const rec = asRecord(part);
-        return rec?.type === "text" && typeof rec.text === "string"
+        return (rec?.type === "text" ||
+          rec?.type === "input_text" ||
+          rec?.type === "output_text") &&
+          typeof rec.text === "string"
           ? rec.text
           : "";
       })
@@ -223,8 +331,24 @@ export function responsesToolOutputs(input: unknown): ClientToolOutput[] {
     if (typeof item.call_id !== "string" || !item.call_id) {
       throw new Error("function_call_output is missing call_id");
     }
+    const hasName = Object.hasOwn(item, "name");
+    const hasNamespace = Object.hasOwn(item, "namespace");
+    if (hasName && (typeof item.name !== "string" || !item.name.trim())) {
+      throw new Error("function_call_output has invalid name");
+    }
+    if (
+      hasNamespace &&
+      (typeof item.namespace !== "string" || !item.namespace.trim())
+    ) {
+      throw new Error("function_call_output has invalid namespace");
+    }
+    if (hasNamespace && !hasName) {
+      throw new Error("function_call_output namespace is missing name");
+    }
     outputs.push({
       callId: item.call_id,
+      ...(hasName ? { name: item.name as string } : {}),
+      ...(hasNamespace ? { namespace: item.namespace as string } : {}),
       output: stringifyOutput(item.output),
     });
   }

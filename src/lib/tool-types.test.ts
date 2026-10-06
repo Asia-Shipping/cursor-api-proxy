@@ -68,6 +68,62 @@ describe("tool normalization", () => {
     ).toThrow(/Duplicate/);
   });
 
+  it("preserves namespace identity when bare names collide", () => {
+    const tools = parseOpenAiFunctionTools(
+      [
+        { type: "function", name: "search" },
+        {
+          type: "namespace",
+          name: "mcp__docs",
+          description: "Search documentation.",
+          tools: [{ type: "function", name: "search" }],
+        },
+        {
+          type: "namespace",
+          name: "mcp__wiki",
+          tools: [{ type: "function", name: "search" }],
+        },
+      ],
+      undefined,
+      { allowNamespaces: true },
+    );
+
+    expect(tools.map(({ namespace, name }) => [namespace, name])).toEqual([
+      [undefined, "search"],
+      ["mcp__docs", "search"],
+      ["mcp__wiki", "search"],
+    ]);
+    expect(tools[1].namespaceDescription).toBe("Search documentation.");
+  });
+
+  it("rejects malformed namespace groups and unsupported nested tools", () => {
+    expect(() =>
+      parseOpenAiFunctionTools(
+        [{ type: "namespace", name: "empty" }],
+        undefined,
+        { allowNamespaces: true },
+      ),
+    ).toThrow(/missing tools array/);
+    expect(() =>
+      parseOpenAiFunctionTools(
+        [
+          {
+            type: "namespace",
+            name: "custom",
+            tools: [{ type: "custom", name: "patch" }],
+          },
+        ],
+        undefined,
+        { allowNamespaces: true },
+      ),
+    ).toThrow(/Unsupported tool type in namespace/);
+    expect(() =>
+      parseOpenAiFunctionTools([
+        { type: "namespace", name: "chat-only", tools: [] },
+      ]),
+    ).toThrow(/only supported by the Responses API/);
+  });
+
   it("implements none, required, named, and no-parallel choices", () => {
     const tools = [
       {
@@ -95,6 +151,28 @@ describe("tool normalization", () => {
       resolveToolChoice(tools, { type: "tool", name: "missing" }),
     ).toThrow(/Unknown/);
   });
+
+  it("requires namespace-qualified choices when function names collide", () => {
+    const tools = [
+      { name: "lookup", inputSchema: {}, namespace: "alpha" },
+      { name: "lookup", inputSchema: {}, namespace: "beta" },
+    ];
+    expect(() => resolveToolChoice(tools, { type: "function", name: "lookup" }))
+      .toThrow(/Ambiguous.*specify namespace/);
+    expect(
+      resolveToolChoice(tools, {
+        type: "function",
+        namespace: "beta",
+        name: "lookup",
+      }).tools,
+    ).toEqual([tools[1]]);
+    expect(
+      resolveToolChoice(tools, {
+        type: "function",
+        function: { namespace: "alpha", name: "lookup" },
+      }).tools,
+    ).toEqual([tools[0]]);
+  });
 });
 
 describe("tool output correlation", () => {
@@ -117,6 +195,34 @@ describe("tool output correlation", () => {
         },
       ]),
     ).toEqual([{ callId: "call_2", output: "done" }]);
+    expect(
+      responsesToolOutputs([
+        {
+          type: "function_call_output",
+          call_id: "call_3",
+          namespace: "mcp__docs",
+          name: "search",
+          output: "done",
+        },
+      ]),
+    ).toEqual([
+      {
+        callId: "call_3",
+        namespace: "mcp__docs",
+        name: "search",
+        output: "done",
+      },
+    ]);
+    expect(() =>
+      responsesToolOutputs([
+        {
+          type: "function_call_output",
+          call_id: "call_4",
+          namespace: "mcp__docs",
+          output: "done",
+        },
+      ]),
+    ).toThrow(/namespace is missing name/);
   });
 
   it("reads Anthropic tool_result and error state", () => {

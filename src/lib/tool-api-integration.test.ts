@@ -78,6 +78,9 @@ async function post(
   return {
     status: response.status,
     text: await response.text(),
+    promptTruncatedHeader: response.headers.get(
+      "x-cursor-proxy-prompt-truncated",
+    ),
   };
 }
 
@@ -202,6 +205,124 @@ describe.each([false, true])("ACP tool APIs stream=%s", (stream) => {
     expect(JSON.parse(follow.text).output_text).toContain("Tool result: sunny");
   });
 
+  it("round-trips namespace identity through ACP and continuation", async () => {
+    const base = await start("tool_last");
+    const tools = [
+      { type: "function", name: "search" },
+      {
+        type: "namespace",
+        name: "mcp__docs",
+        description: "Search internal documentation.",
+        tools: [{ type: "function", name: "search" }],
+      },
+      {
+        type: "namespace",
+        name: "mcp__wiki",
+        description: "Search the company wiki.",
+        tools: [{ type: "function", name: "search" }],
+      },
+    ];
+    const initial = await post(base, "/v1/responses", {
+      model: "gpt-4",
+      stream,
+      input: "Search the wiki",
+      tools,
+      tool_choice: {
+        type: "function",
+        namespace: "mcp__wiki",
+        name: "search",
+      },
+    });
+    expect(initial.status).toBe(200);
+    const events = stream ? sseData(initial.text) : [];
+    const payload = stream
+      ? events.find((event) => event.type === "response.completed").response
+      : JSON.parse(initial.text);
+    const call = payload.output.find(
+      (item: any) => item.type === "function_call",
+    );
+    expect(call).toMatchObject({ namespace: "mcp__wiki", name: "search" });
+    if (stream) {
+      expect(
+        events.some(
+          (event) =>
+            event.type === "response.output_item.done" &&
+            event.item?.type === "function_call" &&
+            event.item.namespace === "mcp__wiki" &&
+            event.item.name === "search",
+        ),
+      ).toBe(true);
+    }
+
+    const continuation = {
+      model: "gpt-4",
+      previous_response_id: payload.id,
+      tools,
+      input: [
+        {
+          type: "function_call_output",
+          call_id: call.call_id,
+          namespace: "mcp__wiki",
+          name: "search",
+          output: "wiki result",
+        },
+      ],
+    };
+    const wrongIdentity = await post(base, "/v1/responses", {
+      ...continuation,
+      input: [
+        {
+          ...continuation.input[0],
+          namespace: "mcp__docs",
+        },
+      ],
+    });
+    expect(wrongIdentity.status).toBe(400);
+    expect(JSON.parse(wrongIdentity.text).error.code).toBe(
+      "invalid_tool_identity",
+    );
+
+    const wrongDefinition = await post(base, "/v1/responses", {
+      ...continuation,
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__docs",
+          tools: [{ type: "function", name: "search" }],
+        },
+      ],
+    });
+    expect(wrongDefinition.status).toBe(400);
+    expect(JSON.parse(wrongDefinition.text).error.code).toBe(
+      "invalid_tool_definition",
+    );
+
+    const follow = await post(base, "/v1/responses", continuation);
+    expect(follow.status).toBe(200);
+    expect(JSON.parse(follow.text).output_text).toContain("wiki result");
+  });
+
+  it("keeps long prompts intact when delivered through ACP", async () => {
+    const base = await start("prompt_length");
+    const prompt = "long-prompt-marker-".repeat(3_000);
+    const initial = await post(base, "/v1/responses", {
+      model: "gpt-4",
+      stream,
+      input: prompt,
+    });
+    expect(initial.status).toBe(200);
+    expect(initial.promptTruncatedHeader).toBeNull();
+    const events = stream ? sseData(initial.text) : [];
+    const outputText = stream
+      ? events.find((event) => event.type === "response.completed").response
+          .output_text
+      : JSON.parse(initial.text).output_text;
+    const receivedLength = Number(
+      outputText.match(/Prompt characters: (\d+)/)?.[1],
+    );
+    expect(receivedLength).toBeGreaterThan(prompt.length);
+  });
+
   it("round-trips Anthropic tool_use blocks", async () => {
     const base = await start();
     const initial = await post(base, "/v1/messages", {
@@ -281,6 +402,218 @@ describe.each([false, true])("ACP tool APIs stream=%s", (stream) => {
 });
 
 describe("ACP tool session errors", () => {
+  it("resumes store=false namespace turns from validated full transcripts without response IDs", async () => {
+    const base = await start("tool_two_round");
+    const initialInput = [
+      {
+        role: "user",
+        content: [{ type: "input_text", text: "Look this up twice" }],
+      },
+    ];
+    const tools = [
+      {
+        type: "namespace",
+        name: "mcp__alpha",
+        description: "Alpha MCP server",
+        tools: [
+          {
+            type: "function",
+            name: "lookup",
+            description: "Look up an item",
+            parameters: { type: "object", properties: {} },
+          },
+        ],
+      },
+    ];
+    const controls = {
+      model: "gpt-4",
+      mode: "agent",
+      instructions: "Use the lookup tool twice.",
+      tools,
+      tool_choice: {
+        type: "function",
+        namespace: "mcp__alpha",
+        name: "lookup",
+      },
+      parallel_tool_calls: false,
+      store: false,
+    };
+    const initial = await post(base, "/v1/responses", {
+      ...controls,
+      input: initialInput,
+    });
+    expect(initial.status).toBe(200);
+    const firstPayload = JSON.parse(initial.text);
+    const firstCall = firstPayload.output.find(
+      (item: any) => item.type === "function_call",
+    );
+    expect(firstCall).toMatchObject({
+      namespace: "mcp__alpha",
+      name: "lookup",
+    });
+
+    const replayedOutput = firstPayload.output.map((item: any) =>
+      item.type === "message"
+        ? {
+            role: "assistant",
+            content: item.content.map((part: any) => ({
+              type: "output_text",
+              text: part.text,
+            })),
+          }
+        : {
+            type: "function_call",
+            call_id: item.call_id,
+            namespace: item.namespace,
+            name: item.name,
+            arguments: item.arguments,
+          },
+    );
+    const firstOutput = {
+      type: "function_call_output",
+      call_id: firstCall.call_id,
+      namespace: "mcp__alpha",
+      name: "lookup",
+      output: "first-result",
+    };
+    const firstTranscript = [...initialInput, ...replayedOutput, firstOutput];
+
+    const changedInput = await post(base, "/v1/responses", {
+      ...controls,
+      input: [
+        { ...initialInput[0], content: [{ type: "input_text", text: "Changed" }] },
+        ...replayedOutput,
+        firstOutput,
+      ],
+    });
+    expect(changedInput.status).toBe(400);
+    expect(JSON.parse(changedInput.text).error.code).toBe("invalid_tool_resume");
+
+    const changedInstructions = await post(base, "/v1/responses", {
+      ...controls,
+      instructions: "Use a different instruction.",
+      input: firstTranscript,
+    });
+    expect(changedInstructions.status).toBe(400);
+    expect(JSON.parse(changedInstructions.text).error.code).toBe(
+      "invalid_tool_resume",
+    );
+
+    const changedTools = await post(base, "/v1/responses", {
+      ...controls,
+      tools: [
+        {
+          ...tools[0],
+          tools: [
+            {
+              ...tools[0].tools[0],
+              description: "A changed lookup definition",
+            },
+          ],
+        },
+      ],
+      input: firstTranscript,
+    });
+    expect(changedTools.status).toBe(400);
+    expect(JSON.parse(changedTools.text).error.code).toBe(
+      "invalid_tool_definition",
+    );
+
+    const changedIdentity = await post(base, "/v1/responses", {
+      ...controls,
+      input: [
+        ...initialInput,
+        ...replayedOutput,
+        { ...firstOutput, namespace: "mcp__beta" },
+      ],
+    });
+    expect(changedIdentity.status).toBe(400);
+    expect(JSON.parse(changedIdentity.text).error.code).toBe(
+      "invalid_tool_identity",
+    );
+
+    const newUserDuringParkedTurn = await post(base, "/v1/responses", {
+      ...controls,
+      input: [
+        ...firstTranscript,
+        { role: "user", content: "Start another task" },
+      ],
+    });
+    expect(newUserDuringParkedTurn.status).toBe(400);
+    expect(JSON.parse(newUserDuringParkedTurn.text).error.code).toBe(
+      "invalid_tool_resume",
+    );
+
+    const firstResumeReplies = await Promise.all([
+      post(base, "/v1/responses", {
+        ...controls,
+        input: firstTranscript,
+      }),
+      post(base, "/v1/responses", {
+        ...controls,
+        input: firstTranscript,
+      }),
+    ]);
+    const firstResume = firstResumeReplies.find((reply) => reply.status === 200)!;
+    const rejectedResume = firstResumeReplies.find(
+      (reply) => reply.status !== 200,
+    )!;
+    expect(firstResume).toBeDefined();
+    expect(rejectedResume).toBeDefined();
+    expect([400, 409]).toContain(rejectedResume.status);
+    expect(["invalid_tool_resume", "tool_session_expired"]).toContain(
+      JSON.parse(rejectedResume.text).error.code,
+    );
+    expect(firstResume.status).toBe(200);
+    const firstResumePayload = JSON.parse(firstResume.text);
+    const secondCall = firstResumePayload.output.find(
+      (item: any) => item.type === "function_call",
+    );
+    expect(secondCall).toMatchObject({
+      namespace: "mcp__alpha",
+      name: "lookup",
+    });
+
+    const replayOnlyOldOutput = await post(base, "/v1/responses", {
+      ...controls,
+      input: [firstOutput],
+    });
+    expect(replayOnlyOldOutput.status).toBe(400);
+    expect(JSON.parse(replayOnlyOldOutput.text).error.code).toBe(
+      "invalid_tool_resume",
+    );
+
+    const secondTranscript = [
+      ...firstTranscript,
+      ...firstResumePayload.output.map((item: any) =>
+        item.type === "message"
+          ? { role: "assistant", content: item.content }
+          : {
+              type: "function_call",
+              call_id: item.call_id,
+              namespace: item.namespace,
+              name: item.name,
+              arguments: item.arguments,
+            },
+      ),
+      {
+        type: "function_call_output",
+        call_id: secondCall.call_id,
+        namespace: "mcp__alpha",
+        name: "lookup",
+        output: "second-result",
+      },
+    ];
+    const secondResume = await post(base, "/v1/responses", {
+      ...controls,
+      input: secondTranscript,
+    });
+    expect(secondResume.status).toBe(200);
+    expect(JSON.parse(secondResume.text).output_text).toContain(
+      "first-result, second-result",
+    );
+  });
+
   it("returns conflict for unknown tool call ids", async () => {
     const base = await start();
     const response = await post(base, "/v1/chat/completions", {
@@ -434,7 +767,7 @@ describe("ACP tool session errors", () => {
     ).toBe(true);
   });
 
-  it("rejects unsupported tool types and store=false tool loops", async () => {
+  it("rejects unsupported tool types", async () => {
     const base = await start();
     const unsupported = await post(base, "/v1/chat/completions", {
       model: "gpt-4",
@@ -444,19 +777,5 @@ describe("ACP tool session errors", () => {
     expect(unsupported.status).toBe(400);
     expect(JSON.parse(unsupported.text).error.code).toBe("invalid_tools");
 
-    const noStore = await post(base, "/v1/responses", {
-      model: "gpt-4",
-      input: "Weather?",
-      store: false,
-      tools: [
-        {
-          type: "function",
-          name: "weather",
-          parameters: { type: "object", properties: {} },
-        },
-      ],
-    });
-    expect(noStore.status).toBe(400);
-    expect(JSON.parse(noStore.text).error.code).toBe("invalid_store");
   });
 });

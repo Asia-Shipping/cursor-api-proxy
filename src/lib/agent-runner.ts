@@ -51,7 +51,7 @@ function extractModeFromCmdArgs(cmdArgs: string[]): CursorExecutionMode {
   const m =
     i >= 0 && i + 1 < cmdArgs.length ? cmdArgs[i + 1] : undefined;
   if (m === "agent" || m === "ask" || m === "plan") return m;
-  return "ask";
+  return "agent";
 }
 
 function acpInvocation(

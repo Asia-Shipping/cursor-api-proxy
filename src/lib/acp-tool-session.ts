@@ -134,8 +134,13 @@ export class AcpToolSession {
       if (!this.#sessionId) throw new Error("ACP session/new returned no sessionId");
       await this.#setModel(session);
       this.#armTtl();
+      const promptWithToolRouting = this.#opts.tools.some(
+        (tool) => tool.namespace,
+      )
+        ? `${prompt}\n\nMCP namespace routing: The namespaced functions in this turn are available through the injected MCP server "${this.bridge.serverName}". Call GetDynamicTools for that exact server to discover/list its tools, then call CallDynamicTool with the same server name and the advertised tool alias whose description's Namespace and Function values match the requested function. Namespace and function names identify the logical API function; they are not MCP server names or callable MCP tool names. Do not substitute the namespace or qualified namespace.function for the injected server name or listed alias.`
+        : prompt;
       this.#promptDone = this.#connection
-        .prompt(this.#sessionId, prompt, 0)
+        .prompt(this.#sessionId, promptWithToolRouting, 0)
         .then(() => ({ ok: true }) as const)
         .catch((error: unknown) => ({
           ok: false as const,
@@ -157,6 +162,17 @@ export class AcpToolSession {
 
   hasCall(callId: string): boolean {
     return this.bridge.has(callId);
+  }
+
+  matchesOutput(output: ClientToolOutput): boolean {
+    return this.bridge.matchesOutput(output);
+  }
+
+  matchesDefinition(
+    callId: string,
+    definitions: readonly ClientToolDefinition[],
+  ): boolean {
+    return this.bridge.matchesDefinition(callId, definitions);
   }
 
   pendingCalls(): PendingClientToolCall[] {

@@ -1,4 +1,9 @@
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import * as http from "node:http";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -46,6 +51,29 @@ function safeTokenEqual(actual: string, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function internalToolName(definition: ClientToolDefinition): string {
+  const identity = JSON.stringify([
+    definition.namespace ?? null,
+    definition.name,
+  ]);
+  const digest = createHash("sha256").update(identity).digest("hex");
+  return `tool_${digest.slice(0, 40)}`;
+}
+
+function mcpToolDescription(definition: ClientToolDefinition): string | undefined {
+  if (!definition.namespace) return definition.description;
+  return [
+    `Namespace: ${definition.namespace}`,
+    definition.namespaceDescription
+      ? `Namespace description: ${definition.namespaceDescription}`
+      : undefined,
+    `Function: ${definition.name}`,
+    definition.description,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 /**
  * Per-agent-turn MCP server. It exposes caller-provided schemas but never
  * executes them. tools/call is parked until the HTTP API caller submits the
@@ -56,6 +84,8 @@ export class ClientToolBridge {
 
   readonly #definitions: ClientToolDefinition[];
   readonly #definitionNames: Set<string>;
+  readonly #definitionsByMcpName = new Map<string, ClientToolDefinition>();
+  readonly #mcpNames: string[] = [];
   readonly #token = randomBytes(32).toString("base64url");
   readonly #path = `/mcp/${randomUUID()}`;
   readonly #mcp: Server;
@@ -70,7 +100,32 @@ export class ClientToolBridge {
 
   constructor(definitions: readonly ClientToolDefinition[]) {
     this.#definitions = [...definitions];
-    this.#definitionNames = new Set(definitions.map((tool) => tool.name));
+    this.#definitionNames = new Set();
+    const reservedNames = new Set(
+      this.#definitions
+        .filter((definition) => definition.namespace)
+        .map(internalToolName),
+    );
+    const usedNames = new Set<string>();
+    for (const definition of this.#definitions) {
+      const safeBareName = /^[A-Za-z0-9_-]{1,64}$/.test(definition.name);
+      const name =
+        !definition.namespace &&
+        safeBareName &&
+        !reservedNames.has(definition.name) &&
+        !usedNames.has(definition.name)
+          ? definition.name
+          : internalToolName(definition);
+      if (this.#definitionsByMcpName.has(name)) {
+        throw new Error(
+          `MCP tool alias collision for ${definition.namespace ? `${definition.namespace}.` : ""}${definition.name}`,
+        );
+      }
+      usedNames.add(name);
+      this.#mcpNames.push(name);
+      this.#definitionNames.add(name);
+      this.#definitionsByMcpName.set(name, definition);
+    }
     this.serverName = `cursor-api-proxy-${randomUUID().slice(0, 8)}`;
 
     this.#mcp = new Server(
@@ -85,9 +140,11 @@ export class ClientToolBridge {
     this.#mcp.setRequestHandler(ListToolsRequestSchema, async () => {
       this.#listed = true;
       return {
-        tools: this.#definitions.map((tool) => ({
-          name: tool.name,
-          ...(tool.description ? { description: tool.description } : {}),
+        tools: this.#definitions.map((tool, index) => ({
+          name: this.#mcpNames[index],
+          ...(mcpToolDescription(tool)
+            ? { description: mcpToolDescription(tool) }
+            : {}),
           inputSchema: tool.inputSchema,
         })),
       };
@@ -95,7 +152,8 @@ export class ClientToolBridge {
 
     this.#mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
-      if (!this.#definitionNames.has(name)) {
+      const definition = this.#definitionsByMcpName.get(name);
+      if (!definition || !this.#definitionNames.has(name)) {
         throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
       }
       if (this.#closed) {
@@ -119,7 +177,10 @@ export class ClientToolBridge {
         this.#pending.set(callId, {
           callId,
           itemId,
-          name,
+          name: definition.name,
+          ...(definition.namespace
+            ? { namespace: definition.namespace }
+            : {}),
           arguments: argumentsJson,
           exposed: false,
           resolve,
@@ -208,10 +269,11 @@ export class ClientToolBridge {
 
   pendingCalls(): PendingClientToolCall[] {
     return [...this.#pending.values()].map(
-      ({ callId, itemId, name, arguments: args }) => ({
+      ({ callId, itemId, name, namespace, arguments: args }) => ({
         callId,
         itemId,
         name,
+        ...(namespace ? { namespace } : {}),
         arguments: args,
       }),
     );
@@ -220,12 +282,32 @@ export class ClientToolBridge {
   unexposedCalls(): PendingClientToolCall[] {
     return [...this.#pending.values()]
       .filter((call) => !call.exposed)
-      .map(({ callId, itemId, name, arguments: args }) => ({
+      .map(({ callId, itemId, name, namespace, arguments: args }) => ({
         callId,
         itemId,
         name,
+        ...(namespace ? { namespace } : {}),
         arguments: args,
       }));
+  }
+
+  matchesOutput(output: ClientToolOutput): boolean {
+    const call = this.#pending.get(output.callId);
+    if (!call) return false;
+    if (output.name === undefined && output.namespace === undefined) return true;
+    return output.name === call.name && output.namespace === call.namespace;
+  }
+
+  matchesDefinition(
+    callId: string,
+    definitions: readonly ClientToolDefinition[],
+  ): boolean {
+    const call = this.#pending.get(callId);
+    return !!call && definitions.some(
+      (definition) =>
+        definition.name === call.name &&
+        definition.namespace === call.namespace,
+    );
   }
 
   markExposed(callIds: readonly string[]): void {
@@ -251,6 +333,11 @@ export class ClientToolBridge {
     for (const output of outputs) {
       const call = this.#pending.get(output.callId);
       if (!call) throw new Error(`Unknown tool call_id: ${output.callId}`);
+      if (!this.matchesOutput(output)) {
+        throw new Error(
+          `function_call_output identity does not match tool call ${output.callId}`,
+        );
+      }
     }
     for (const output of outputs) {
       const call = this.#pending.get(output.callId);

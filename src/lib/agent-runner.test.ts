@@ -90,4 +90,42 @@ describe("ACP requestTimeoutMs", () => {
       requestTimeoutMs: 123_456,
     });
   });
+
+  it("keeps Cursor's default agent mode when cmd args omit --mode", async () => {
+    await runAgentSync(
+      config(),
+      "/tmp/ws",
+      true,
+      ["--print", "--model", "auto"],
+      undefined,
+      "hello",
+    );
+    expect(vi.mocked(runAcpSync).mock.calls[0][1]).toEqual([
+      "--workspace",
+      "/tmp/ws",
+      "acp",
+      "--model",
+      "auto",
+    ]);
+  });
+
+  it("preserves explicit ask mode for the ACP child", async () => {
+    await runAgentSync(
+      config(),
+      "/tmp/ws",
+      true,
+      ["--print", "--mode", "ask", "--model", "auto"],
+      undefined,
+      "hello",
+    );
+    expect(vi.mocked(runAcpSync).mock.calls[0][1]).toEqual([
+      "--workspace",
+      "/tmp/ws",
+      "acp",
+      "--mode",
+      "ask",
+      "--model",
+      "auto",
+    ]);
+  });
 });

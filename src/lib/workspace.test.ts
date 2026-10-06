@@ -42,7 +42,7 @@ describe("getChatOnlyEnvOverrides", () => {
   it("uses temp workspace .cursor when no auth pool dir", () => {
     const tmp = "/tmp/cursor-proxy-abc123";
     const o = getChatOnlyEnvOverrides(tmp);
-    expect(o.CURSOR_CONFIG_DIR).toBe(`${tmp}/.cursor`);
+    expect(o.CURSOR_CONFIG_DIR).toBe(path.join(tmp, ".cursor"));
   });
 
   it("uses account pool path for CURSOR_CONFIG_DIR when provided", () => {

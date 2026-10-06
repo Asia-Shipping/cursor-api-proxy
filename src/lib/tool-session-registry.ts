@@ -8,6 +8,7 @@ import type {
 } from "./acp-tool-session.js";
 import { extractBearerToken } from "./http.js";
 import type { ClientToolOutput } from "./tool-types.js";
+import type { ResponsesToolReplayState } from "./responses-tool-replay.js";
 
 export type ToolApi = "chat" | "responses" | "anthropic";
 const MAX_GLOBAL_TOOL_SESSIONS = 64;
@@ -40,6 +41,7 @@ export type ToolSessionRecord = {
   session: AcpToolSession;
   mutex: Mutex;
   responseIds: Set<string>;
+  responsesReplay?: ResponsesToolReplayState;
   createdAt: number;
   lastUsed: number;
 };
@@ -128,6 +130,41 @@ export class ToolSessionRegistry {
     );
   }
 
+  findByAnyCallIds(
+    api: ToolApi,
+    ownerKey: string,
+    callIds: readonly string[],
+  ): ToolSessionRecord | undefined {
+    this.#sweep();
+    if (callIds.length === 0) return undefined;
+    const matches = [...this.#records].filter(
+      (record) =>
+        record.api === api &&
+        record.ownerKey === ownerKey &&
+        !record.session.closed &&
+        callIds.some((callId) => record.session.hasCall(callId)),
+    );
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  findByReferencedCallIds(
+    api: ToolApi,
+    ownerKey: string,
+    callIds: readonly string[],
+  ): ToolSessionRecord | undefined {
+    this.#sweep();
+    if (callIds.length === 0) return undefined;
+    const referenced = new Set(callIds);
+    const matches = [...this.#records].filter(
+      (record) =>
+        record.api === api &&
+        record.ownerKey === ownerKey &&
+        !record.session.closed &&
+        record.responsesReplay?.callIds.some((callId) => referenced.has(callId)),
+    );
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
   findByResponseId(
     ownerKey: string,
     responseId: string,
@@ -161,6 +198,7 @@ export class ToolSessionRegistry {
     record: ToolSessionRecord,
     outputs: readonly ClientToolOutput[],
     listener?: (event: ToolTurnEvent) => void,
+    beforeResume?: () => void,
   ): Promise<ToolTurnResult> {
     return record.mutex.run(async () => {
       if (
@@ -173,6 +211,7 @@ export class ToolSessionRegistry {
           "tool_session_expired",
         );
       }
+      beforeResume?.();
       record.lastUsed = Date.now();
       try {
         return await record.session.resume(outputs, listener);

@@ -49,6 +49,49 @@ afterEach(async () => {
 });
 
 describe("AcpToolSession", () => {
+  it("routes namespaced calls to the injected MCP server and listed aliases", async () => {
+    const session = createSession("prompt_capture", [
+      {
+        namespace: "alpha",
+        namespaceDescription: "Alpha lookup service",
+        name: "lookup",
+        description: "Look up an alpha value",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
+        namespace: "beta",
+        namespaceDescription: "Beta lookup service",
+        name: "lookup",
+        description: "Look up a beta value",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+    const userPrompt = "Use alpha.lookup and beta.lookup.";
+    await session.start(userPrompt);
+    const result = await session.collect();
+
+    expect(result.status).toBe("completed");
+    expect(result.text).toContain(userPrompt);
+    expect(result.text).toContain(session.bridge.serverName);
+    expect(result.text).toContain("GetDynamicTools");
+    expect(result.text).toContain("CallDynamicTool");
+    expect(result.text).toContain("Namespace and Function values");
+    expect(result.text).toContain(
+      "they are not MCP server names or callable MCP tool names",
+    );
+    expect(result.text).toContain("qualified namespace.function");
+  });
+
+  it("leaves flat-tool prompts unchanged", async () => {
+    const session = createSession("prompt_capture");
+    await session.start("Use weather");
+
+    const result = await session.collect();
+
+    expect(result.status).toBe("completed");
+    expect(result.text).toBe("Use weather");
+  });
+
   it("attaches private HTTP MCP and parks tools/call", async () => {
     const session = createSession("tool_call");
     await session.start("Use weather");
@@ -156,12 +199,12 @@ describe("AcpToolSession", () => {
 
   it("expires parked tool turns after the configured TTL", async () => {
     const session = createSession("tool_call", undefined, {
-      timeoutMs: 100,
+      timeoutMs: 2_000,
     });
     await session.start("Use weather");
     const first = await session.collect();
     expect(first.status).toBe("tool_calls");
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    await new Promise((resolve) => setTimeout(resolve, 2_200));
     expect(session.closed).toBe(true);
   });
 

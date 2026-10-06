@@ -222,13 +222,12 @@ async function runToolPrompt() {
   update("agent_message_chunk", { content: { text: "Checking tools. " } });
   const parallel = scenario === "tool_parallel";
   const count = parallel ? Math.min(2, tools.length) : 1;
-  const outputs = parallel
-    ? await Promise.all(
-        Array.from({ length: count }, (_, index) =>
-          callTool(server, sessionId, tools[index], index),
-        ),
-      )
-    : [await callTool(server, sessionId, tools[0], 0)];
+  const selectedIndexes = parallel
+    ? Array.from({ length: count }, (_, index) => index)
+    : [scenario === "tool_last" ? tools.length - 1 : 0];
+  const outputs = await Promise.all(
+    selectedIndexes.map((index) => callTool(server, sessionId, tools[index], index)),
+  );
   if (scenario === "tool_two_round") {
     outputs.push(await callTool(server, sessionId, tools[0], 1));
   }
@@ -388,6 +387,24 @@ rl.on("line", (line) => {
       : scenario === "builtin_permission"
         ? runBuiltinPermissionPrompt()
         : Promise.resolve().then(async () => {
+            if (scenario === "prompt_capture") {
+              const promptText = (msg.params?.prompt ?? [])
+                .map((part) => part?.text ?? "")
+                .join("");
+              update("agent_message_chunk", {
+                content: { text: promptText },
+              });
+              return;
+            }
+            if (scenario === "prompt_length") {
+              const promptText = (msg.params?.prompt ?? [])
+                .map((part) => part?.text ?? "")
+                .join("");
+              update("agent_message_chunk", {
+                content: { text: `Prompt characters: ${promptText.length}` },
+              });
+              return;
+            }
             if (scenario === "with_thought") {
               update("agent_thought_chunk", {
                 content: { text: "SECRET_THOUGHT" },

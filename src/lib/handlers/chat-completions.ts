@@ -471,11 +471,20 @@ export async function handleChatCompletions(
     mode,
     effectiveChatOnly,
   );
-  const fit = fitPromptToWinCmdline(config.agentBin, fixedArgs, agentPrompt, {
-    maxCmdline: config.winCmdlineMax,
-    platform: process.platform,
-    cwd: workspaceDir,
-  });
+  const promptViaStdin = config.promptViaStdin || config.useAcp;
+  const fit = promptViaStdin
+    ? {
+        ok: true as const,
+        args: fixedArgs,
+        truncated: false,
+        originalLength: agentPrompt.length,
+        finalPromptLength: agentPrompt.length,
+      }
+    : fitPromptToWinCmdline(config.agentBin, fixedArgs, agentPrompt, {
+        maxCmdline: config.winCmdlineMax,
+        platform: process.platform,
+        cwd: workspaceDir,
+      });
   if (!fit.ok) {
     json(res, 500, {
       error: {
@@ -492,11 +501,10 @@ export async function handleChatCompletions(
   // When the prompt is delivered via stdin (or ACP), keep it OUT of argv,
   // otherwise a long prompt still blows past the kernel ARG_MAX (spawn E2BIG
   // on Linux). fit.args appends the full prompt for the argv path only.
-  const cmdArgs =
-    config.promptViaStdin || config.useAcp ? fixedArgs : fit.args;
+  const cmdArgs = promptViaStdin ? fixedArgs : fit.args;
 
   const promptForAgent =
-    config.promptViaStdin || config.useAcp ? agentPrompt : undefined;
+    promptViaStdin ? agentPrompt : undefined;
 
   const truncatedHeaders = fit.truncated
     ? { "X-Cursor-Proxy-Prompt-Truncated": "true" }

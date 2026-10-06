@@ -119,9 +119,11 @@ For agents that need local context: use client-side tools (`read_file`, `run_ter
 Set `CURSOR_BRIDGE_USE_ACP=true` to receive structured client tool calls. Tool-bearing requests require a Cursor ACP build that advertises HTTP MCP support. The proxy supports:
 
 - Chat Completions `tools` / legacy `functions` → `message.tool_calls`; resume with `role: "tool"` and `tool_call_id`.
-- Responses flat function tools → `function_call` output items; resume with `previous_response_id` and `function_call_output`.
+- Responses flat function tools and namespace groups of function tools → `function_call` output items; namespaced calls retain separate `namespace` and `name` fields. Resume an ACP tool turn with `function_call_output`, either as output-only input or as the new tail of a replayed full transcript. `previous_response_id` is optional when the pending call IDs identify the parked turn. If an output includes `namespace`/`name`, both must match the pending call.
 - Anthropic tools with `input_schema` → `tool_use`; resume with `tool_result`.
 - Sync and streaming output, mixed text plus tools, parallel calls, multiple rounds, named/required/none choices.
+
+Namespace groups are supported on the Responses API only. Namespace-qualified `tool_choice` is supported when it identifies a function by both `namespace` and `name`; a bare name shared by multiple tools is ambiguous. Unsupported tool types (including hosted built-ins such as `web_search` and namespace members other than `function`) return `400 invalid_tools` instead of being ignored. ACP Responses continuation validates replayed input, instructions, tool definitions, and supplied execution controls against the parked turn; only exact previously accepted outputs are ignored, and only new pending outputs are delivered. `store:false` works for in-flight ACP turns, which remain in memory until completion or the session TTL and are not persisted or retrievable afterward.
 
 The proxy exposes each request's schemas through a random, bearer-authenticated MCP URL bound only to `127.0.0.1`. It never executes caller tools. It parks Cursor's MCP call, returns the native API tool call to your framework, then delivers your framework's result back to the same live ACP turn. Proxy-owned MCP permission is allowed once; built-in and other tool permissions remain rejected.
 

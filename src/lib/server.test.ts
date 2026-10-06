@@ -1,6 +1,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { startBridgeServer } from "./server.js";
 import { appendSessionLine } from "./request-log.js";
@@ -50,6 +51,51 @@ vi.mock("./request-log.js", () => ({
 }));
 
 const tmpLogPath = "/tmp/cursor-proxy-test-sessions.log";
+
+function listenProbe(server: net.Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, "127.0.0.1");
+  });
+}
+
+async function closeProbe(server: net.Server): Promise<void> {
+  if (!server.listening) return;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+async function availablePortPair(): Promise<number> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const ephemeral = net.createServer();
+    await listenProbe(ephemeral, 0);
+    const address = ephemeral.address();
+    await closeProbe(ephemeral);
+    if (!address || typeof address === "string" || address.port >= 65_535) {
+      continue;
+    }
+
+    const first = net.createServer();
+    const second = net.createServer();
+    try {
+      await listenProbe(first, address.port);
+      await listenProbe(second, address.port + 1);
+      await Promise.all([closeProbe(first), closeProbe(second)]);
+      return address.port;
+    } catch {
+      await Promise.all([closeProbe(first), closeProbe(second)]);
+    }
+  }
+  throw new Error("Could not find two available consecutive ports for test");
+}
 
 function createTestConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
   return {
@@ -686,12 +732,13 @@ describe("startBridgeServer", () => {
   });
 
   it("should spawn multiple servers when multiPort is true", async () => {
+    const port = await availablePortPair();
     servers = startBridgeServer({
       version: "1.0.0",
       config: createTestConfig({
         configDirs: ["/dir1", "/dir2"],
         multiPort: true,
-        port: 10000,
+        port,
       }),
     });
 
